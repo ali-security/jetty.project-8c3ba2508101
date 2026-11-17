@@ -1,0 +1,99 @@
+name: "Seal build jetty-http"
+
+# Upstream jetty builds and tests on Jenkins (Jenkinsfile); its GitHub workflows
+# (codeql, stale) neither build release artifacts nor run tests. This workflow
+# mirrors the Jenkinsfile's `mvn clean install` on the JDK the release used
+# (published jar: Build-Jdk-Spec 25, compiler.release 17) for the jetty-http
+# module, runs jetty-http's full test suite plus jetty-test-rfc (RFC2616Test /
+# RFC7230Test exercise HttpParser end-to-end), and uploads the module jar.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suites"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test jetty-http
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: "-Djava.awt.headless=true -Xmx4G"
+      MVN_ARGS: >-
+        -B -e -V --no-transfer-progress
+        -Daether.remoteRepositoryFilter.groupId=false
+        -Daether.remoteRepositoryFilter.prefixes=false
+        -Dmaven.build.cache.enabled=false
+        -Dspotbugs.skip=true
+        -Dcheckstyle.skip=true
+        -Dspotless.check.skip=true
+        -Dlicense.skip=true
+        -Denforcer.skip=true
+        -Dmaven.javadoc.skip=true
+        -Dmaven.source.skip=true
+        -Dsource.skip=true
+        -Dgpg.skip=true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Prepare Mimir
+        shell: bash
+        run: |
+          mkdir -p ~/.mimir
+          cp .github/ci-mimir-daemon.properties ~/.mimir/daemon.properties
+
+      - name: Set up Maven
+        run: mvn -e -B -V org.apache.maven.plugins:maven-wrapper-plugin:3.3.2:wrapper "-Dmaven=3.9.14"
+
+      - name: Build jetty-http and its test reactor
+        run: |
+          ./mvnw clean install $MVN_ARGS -DskipTests \
+            -pl jetty-core/jetty-http,jetty-core/jetty-tests/jetty-test-rfc -am
+
+      - name: Test jetty-http and jetty-test-rfc
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          FILTER_ARGS=()
+          if [ -n "$TEST_FILTER" ]; then
+            FILTER_ARGS=("-Dtest=$TEST_FILTER" "-Dsurefire.failIfNoSpecifiedTests=false")
+          fi
+          ./mvnw test $MVN_ARGS "${FILTER_ARGS[@]}" \
+            -pl jetty-core/jetty-http,jetty-core/jetty-tests/jetty-test-rfc
+
+      - name: Report skipped tests with reasons
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, xml.etree.ElementTree as ET
+          reports = sorted(glob.glob("jetty-core/jetty-http/target/surefire-reports/TEST-*.xml")
+                           + glob.glob("jetty-core/jetty-tests/jetty-test-rfc/target/surefire-reports/TEST-*.xml"))
+          total = skipped = 0
+          for path in reports:
+              for tc in ET.parse(path).getroot().iter("testcase"):
+                  total += 1
+                  sk = tc.find("skipped")
+                  if sk is not None:
+                      skipped += 1
+                      reason = sk.get("message") or (sk.text or "").strip() or "(no message)"
+                      print(f"SKIPPED {tc.get('classname')}#{tc.get('name')}: {reason}")
+          print(f"Surefire reports: {len(reports)} files, {total} testcases, {skipped} skipped")
+
+      - name: Upload jetty-http jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-http
+          path: jetty-core/jetty-http/target/jetty-http-12.1.8.jar
+          if-no-files-found: error
